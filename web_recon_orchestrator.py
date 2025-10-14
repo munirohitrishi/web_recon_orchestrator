@@ -40,17 +40,26 @@ def check_tool(name):
     return shutil.which(name)
 
 
-def run_cmd(cmd, outdir, name, capture=True, env=None):
+def run_cmd(cmd, outdir, name, capture=True, env=None, timeout=None, dry_run=False):
     """Run command list `cmd` and save stdout/stderr to files in outdir with base name `name`.
-    Returns a dict with exit code and paths."""
+    Returns a dict with exit code and paths. Supports optional timeout (seconds) and dry-run.
+    """
     stdout_f = outdir / f"{name}.out"
     stderr_f = outdir / f"{name}.err"
+
+    if dry_run:
+        print("[DRY-RUN] ", " ".join(map(str, cmd)))
+        return {"rc": 0, "stdout": str(stdout_f), "stderr": str(stderr_f), "note": "dry-run"}
+
     with open(stdout_f, "wb") as so, open(stderr_f, "wb") as se:
         try:
-            proc = subprocess.run(cmd, stdout=so, stderr=se, env=env)
+            proc = subprocess.run(cmd, stdout=so, stderr=se, env=env, timeout=timeout)
             return {"rc": proc.returncode, "stdout": str(stdout_f), "stderr": str(stderr_f)}
+        except subprocess.TimeoutExpired as te:
+            se.write(f"TimeoutExpired: {te}\n".encode())
+            return {"rc": -2, "stdout": str(stdout_f), "stderr": str(stderr_f)}
         except Exception as e:
-            se.write(str(e).encode())
+            se.write(f"Exception: {e}\n".encode())
             return {"rc": -1, "stdout": str(stdout_f), "stderr": str(stderr_f)}
 
 
@@ -73,6 +82,7 @@ def main():
     p.add_argument("--nmap-ports", default="-F", help="Nmap ports option (default -F quick scan)")
     p.add_argument("--threads", type=int, default=20, help="Default threads for httpx/gobuster")
     p.add_argument("--nuclei-templates", default=None, help="Path to nuclei-templates (if None uses default)")
+    p.add_argument("--dry-run", action="store_true", help="Print commands but do not execute them")
     args = p.parse_args()
 
     target = args.target.strip()
@@ -103,7 +113,7 @@ def main():
             print("[>] Running subfinder (passive)")
             sub_out = outdir / "subfinder.txt"
             cmd = [binpath, "-d", target, "-silent", "-o", str(sub_out)]
-            r = run_cmd(cmd, outdir, "subfinder")
+            r = run_cmd(cmd, outdir, "subfinder", dry_run=args.dry_run)
             r.update({"path": str(sub_out)})
             record("subfinder", r)
         else:
@@ -116,11 +126,9 @@ def main():
             print("[>] Gathering archived URLs (gau/waybackurls)")
             urls_f = outdir / "archived_urls.txt"
             cmd = [gau_bin, target]
-            # write stdout directly
-            r = run_cmd(cmd, outdir, "gau")
-            # move produced stdout to urls_f
+            r = run_cmd(cmd, outdir, "gau", dry_run=args.dry_run)
             try:
-                # the run_cmd stored stdout in r['stdout'] path
+                # move produced stdout to urls_f
                 shutil.move(r['stdout'], urls_f)
                 r['path'] = str(urls_f)
             except Exception:
@@ -143,7 +151,7 @@ def main():
                 candidates.write_text(target + "\n")
             dnsx_out = outdir / "dnsx_resolved.txt"
             cmd = [binpath, "-l", str(candidates), "-a", "-silent", "-o", str(dnsx_out)]
-            r = run_cmd(cmd, outdir, "dnsx")
+            r = run_cmd(cmd, outdir, "dnsx", dry_run=args.dry_run)
             r.update({"path": str(dnsx_out)})
             record("dnsx", r)
         else:
@@ -156,12 +164,15 @@ def main():
             print("[>] Probing hosts with httpx")
             # create input list from dnsx or fallback
             dnsx_file = outdir / "dnsx_resolved.txt"
-            input_list = dnsx_file if dnsx_file.exists() else (outdir / "subfinder.txt")
-            httpx_out = outdir / "httpx_out.txt"
-            cmd = [binpath, "-l", str(input_list), "-silent", "-status-code", "-title", "-tech-detect", "-threads", str(args.threads), "-o", str(httpx_out)]
-            r = run_cmd(cmd, outdir, "httpx")
-            r.update({"path": str(httpx_out)})
-            record("httpx", r)
+            input_list = dnsx_file if dnsx_file.exists() and dnsx_file.stat().st_size>0 else (outdir / "subfinder.txt")
+            if not input_list.exists() or input_list.stat().st_size == 0:
+                print("[!] httpx: no input hosts to probe; skipping httpx")
+            else:
+                httpx_out = outdir / "httpx_out.txt"
+                cmd = [binpath, "-l", str(input_list), "-silent", "-status-code", "-title", "-tech-detect", "-threads", str(args.threads), "-o", str(httpx_out)]
+                r = run_cmd(cmd, outdir, "httpx", dry_run=args.dry_run)
+                r.update({"path": str(httpx_out)})
+                record("httpx", r)
         else:
             print("[!] httpx not found; skipping")
 
@@ -169,7 +180,7 @@ def main():
     # (If gau produced archived_urls.txt, download those pages to fetched/ for later inspection)
     archived = outdir / "archived_urls.txt"
     fetched_dir = outdir / "fetched"
-    fetched_dir.mkdir(exist_ok=True)
+    fetched_dir.mkdir(parents=True, exist_ok=True)
     if archived.exists() and archived.stat().st_size > 0:
         print("[>] Fetching archived URLs (safe GETs)")
         with open(archived) as fh:
@@ -182,7 +193,10 @@ def main():
                 safe_name = f"url_{i}.html"
                 outf = fetched_dir / safe_name
                 try:
-                    subprocess.run(["curl", "-sL", url, "-o", str(outf)], check=False)
+                    if args.dry_run:
+                        print("[DRY-RUN] curl -sL", url)
+                    else:
+                        subprocess.run(["curl", "-sL", url, "-o", str(outf)], check=False)
                 except Exception:
                     continue
         record("fetched_archives", {"path": str(fetched_dir)})
@@ -191,17 +205,42 @@ def main():
     if not args.no_nuclei:
         binpath = check_tool("nuclei")
         if binpath:
-            print("[>] Running nuclei (conservative) ")
+            print("[>] Running nuclei (conservative)")
+
             live_hosts = outdir / "httpx_out.txt"
-            nuclei_out = outdir / "nuclei.json"
-            nuclei_args = [binpath, "-l", str(live_hosts), "-json", "-o", str(nuclei_out), "-rate", "150"]
-            if args.nuclei_templates:
-                nuclei_args.extend(["-t", args.nuclei_templates])
-            r = run_cmd(nuclei_args, outdir, "nuclei")
-            r.update({"path": str(nuclei_out)})
-            record("nuclei", r)
+            if not live_hosts.exists() or live_hosts.stat().st_size == 0:
+                print("[!] nuclei: no live hosts file found or file empty, skipping nuclei")
+                record("nuclei", {"rc": 0, "note": "skipped - no live hosts"})
+            else:
+                # decide which JSON flag is supported by this nuclei binary
+                help_out = subprocess.run([binpath, "-h"], capture_output=True, text=True)
+                help_txt = help_out.stdout + "\n" + help_out.stderr
+
+                # prefer JSONL export if available
+                if "-jle" in help_txt or "--jsonl-export" in help_txt:
+                    nuclei_out = outdir / "nuclei.jsonl"
+                    nuclei_args = [binpath, "-l", str(live_hosts), "-jle", str(nuclei_out), "-rate", "150"]
+                elif "-je" in help_txt or "--json-export" in help_txt:
+                    nuclei_out = outdir / "nuclei.json"
+                    nuclei_args = [binpath, "-l", str(live_hosts), "-je", str(nuclei_out), "-rate", "150"]
+                elif "-jsonl" in help_txt:
+                    nuclei_out = outdir / "nuclei.jsonl"
+                    nuclei_args = [binpath, "-l", str(live_hosts), "-jsonl", "-o", str(nuclei_out), "-rate", "150"]
+                else:
+                    # fallback to plain text output
+                    nuclei_out = outdir / "nuclei.txt"
+                    nuclei_args = [binpath, "-l", str(live_hosts), "-o", str(nuclei_out), "-rate", "150"]
+
+                if args.nuclei_templates:
+                    nuclei_args.extend(["-t", args.nuclei_templates])
+
+                # run with a timeout to avoid indefinite hang (adjust seconds as needed)
+                r = run_cmd(nuclei_args, outdir, "nuclei", timeout=1800, dry_run=args.dry_run)
+                r.update({"path": str(nuclei_out)})
+                record("nuclei", r)
         else:
             print("[!] nuclei not found; skipping")
+
 
     # ---------------- nmap ----------------
     if not args.no_nmap:
@@ -211,8 +250,12 @@ def main():
             resolved = outdir / "dnsx_resolved.txt"
             hosts_in = resolved if resolved.exists() and resolved.stat().st_size > 0 else outdir / "subfinder.txt"
             nmap_out = outdir / "nmap.xml"
-            cmd = [binpath, "-iL", str(hosts_in), "-Pn", "-sV", args.nmap_ports, "-oX", str(nmap_out)]
-            r = run_cmd(cmd, outdir, "nmap")
+            nmap_base = [binpath, "-iL", str(hosts_in), "-Pn", "-sV", "-oX", str(nmap_out)]
+            # args.nmap_ports may be "-F" or "-p 22,80" or "-p 1-100"; support multiple tokens
+            if args.nmap_ports:
+                nmap_base.extend(args.nmap_ports.split())
+            cmd = nmap_base
+            r = run_cmd(cmd, outdir, "nmap", timeout=3600, dry_run=args.dry_run)
             r.update({"path": str(nmap_out)})
             record("nmap", r)
         else:
@@ -229,7 +272,7 @@ def main():
             wordlist = args.wordlist or "/usr/share/wordlists/dirb/common.txt"
             # run gobuster against main target only to avoid huge scans; user can expand later
             cmd = [binpath, "dir", "-u", f"https://{target}", "-w", wordlist, "-t", str(max(5, args.threads//2)), "-o", str(gob_out), "-s", "200,204,301,302,307,401,403"]
-            r = run_cmd(cmd, outdir, "gobuster")
+            r = run_cmd(cmd, outdir, "gobuster", dry_run=args.dry_run)
             r.update({"path": str(gob_out)})
             record("gobuster", r)
         else:
@@ -242,7 +285,7 @@ def main():
             print("[>] Running wpscan (user enumeration only - safe) ")
             wpscan_out = outdir / "wpscan_users.txt"
             cmd = [binpath, "--url", f"https://{target}", "--enumerate", "u", "--ignore-main-redirect"]
-            r = run_cmd(cmd, outdir, "wpscan")
+            r = run_cmd(cmd, outdir, "wpscan", dry_run=args.dry_run)
             r.update({"path": str(wpscan_out)})
             record("wpscan", r)
         else:
@@ -258,7 +301,7 @@ def main():
             baseline_script = check_tool("zap-baseline.py")
             if baseline_script:
                 cmd = [baseline_script, "-t", f"https://{target}", "-r", str(zap_out)]
-                r = run_cmd(cmd, outdir, "zap_baseline")
+                r = run_cmd(cmd, outdir, "zap_baseline", dry_run=args.dry_run)
                 r.update({"path": str(zap_out)})
                 record("zap", r)
             else:
@@ -291,3 +334,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
