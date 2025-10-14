@@ -27,3 +27,35 @@ sudo apt install -y curl wget unzip git nmap jq python3 python3-venv python3-dev
 
 # optional GUI tools
 # OWASP ZAP usually installed separately (download/extract ZAP or install via package manager)
+
+
+Tools to install (make sure they are in PATH)
+
+subfinder
+
+dnsx
+
+httpx
+
+nuclei (and nuclei-templates)
+
+nmap
+
+gobuster
+
+massdns (optional)
+
+wpscan
+
+gau or waybackurls (optional)
+
+OWASP ZAP (optional; to run baseline scans)
+
+You can install many ProjectDiscovery tools with Go:
+
+# example
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/OJ/gobuster/v3@latest
